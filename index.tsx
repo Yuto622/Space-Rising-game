@@ -9,17 +9,12 @@ const FRICTION = 0.9;
 const SCREEN_WRAP = true;
 
 const COLORS = {
-  backgroundTop: '#0f0c29',
-  backgroundBottom: '#302b63',
+  backgroundTop: '#050510',
+  backgroundBottom: '#1a0b2e',
   player: '#ffffff',
   playerEngine: '#00f2ff',
-  platformNormal: '#00f2ff', // Cyan
-  platformBoost: '#ff0055', // Magenta
-  platformSpecial: '#ffcc00', // Yellow/Gold
-  platformMoving: '#39ff14', // Neon Green
-  platformBreakable: '#ff4d4d', // Red/Orange
   text: '#ffffff',
-  uiOverlay: 'rgba(0, 0, 0, 0.7)',
+  uiOverlay: 'rgba(0, 0, 0, 0.85)',
 };
 
 // --- Types ---
@@ -34,7 +29,7 @@ type Particle = {
   color: string;
   size: number;
 };
-type PlatformType = 'NORMAL' | 'BOOST' | 'DOUBLE_JUMP_CHARGER' | 'MOVING' | 'BREAKABLE';
+type PlatformType = 'NORMAL' | 'BOOST' | 'DOUBLE_JUMP_CHARGER' | 'MOVING' | 'BREAKABLE' | 'PHANTOM' | 'SHRINKING';
 
 class Platform {
   x: number;
@@ -45,6 +40,18 @@ class Platform {
   visualOffset: number; // For floating animation
   vx: number = 0;
   broken: boolean = false;
+  // For Phantom
+  phantomPhase: number = 0;
+  opacity: number = 1.0;
+  // For Shrinking
+  shrinkRate: number = 0.05;
+  
+  // Visual specific properties
+  rotationAngle: number = 0;
+  visualSeed: number;
+  craters: {x: number, y: number, r: number}[] = [];
+  stripes: {y: number, w: number}[] = [];
+  techLines: {x: number, y: number, len: number, angle: number}[] = [];
 
   constructor(x: number, y: number, type: PlatformType) {
     this.x = x;
@@ -52,14 +59,32 @@ class Platform {
     this.type = type;
     this.id = Math.random();
     this.visualOffset = Math.random() * Math.PI * 2;
+    this.phantomPhase = Math.random() * Math.PI * 2;
+    this.visualSeed = Math.random();
+    this.rotationAngle = Math.random() * Math.PI * 2;
 
-    // Type specific config
+    // Type specific config & Visual Gen
     switch (type) {
       case 'NORMAL':
         this.radius = 30;
+        // Ice patches
+        for (let i = 0; i < 3; i++) {
+           this.craters.push({
+               x: (Math.random() - 0.5) * 20,
+               y: (Math.random() - 0.5) * 20,
+               r: Math.random() * 8 + 5
+           });
+        }
         break;
       case 'BOOST':
         this.radius = 25;
+        // Gas giant stripes
+        for (let i = 0; i < 4; i++) {
+            this.stripes.push({
+                y: (Math.random() - 0.5) * 40,
+                w: Math.random() * 5 + 3
+            });
+        }
         break;
       case 'DOUBLE_JUMP_CHARGER':
         this.radius = 20;
@@ -67,9 +92,33 @@ class Platform {
       case 'MOVING':
         this.radius = 28;
         this.vx = (Math.random() > 0.5 ? 1 : -1) * (2 + Math.random() * 1.5);
+        // Tech lines
+        for(let i=0; i<6; i++) {
+            this.techLines.push({
+                x: (Math.random() - 0.5) * 30,
+                y: (Math.random() - 0.5) * 30,
+                len: Math.random() * 15 + 5,
+                angle: Math.floor(Math.random() * 4) * (Math.PI / 2)
+            });
+        }
         break;
       case 'BREAKABLE':
         this.radius = 28;
+        // Craters
+        for (let i = 0; i < 4; i++) {
+            this.craters.push({
+                x: (Math.random() - 0.5) * 25,
+                y: (Math.random() - 0.5) * 25,
+                r: Math.random() * 6 + 2
+            });
+        }
+        break;
+      case 'PHANTOM':
+        this.radius = 28;
+        break;
+      case 'SHRINKING':
+        this.radius = 35; // Start slightly larger
+        this.shrinkRate = 0.03 + Math.random() * 0.03;
         break;
       default:
         this.radius = 30;
@@ -77,6 +126,8 @@ class Platform {
   }
 
   update(width: number) {
+    this.rotationAngle += 0.01; // Slowly rotate visuals
+
     if (this.type === 'MOVING') {
       this.x += this.vx;
       // Bounce off walls
@@ -88,85 +139,200 @@ class Platform {
         this.x = width - this.radius;
         this.vx *= -1;
       }
+    } else if (this.type === 'PHANTOM') {
+        this.phantomPhase += 0.05;
+        // Opacity follows a sine wave, clamped
+        const val = Math.sin(this.phantomPhase);
+        // Be solid for 60% of time, fade out quickly
+        if (val > -0.2) {
+            this.opacity = 1.0;
+        } else {
+            this.opacity = 0.2; // Ghost mode
+        }
+    } else if (this.type === 'SHRINKING') {
+        this.radius -= this.shrinkRate;
+        if (this.radius < 0) this.radius = 0;
     }
+  }
+
+  isCollidable(): boolean {
+      if (this.broken) return false;
+      if (this.type === 'PHANTOM' && this.opacity < 0.5) return false;
+      if (this.type === 'SHRINKING' && this.radius < 10) return false;
+      return true;
   }
 
   draw(ctx: CanvasRenderingContext2D, time: number) {
     if (this.broken) return;
+    if (this.radius <= 0) return;
 
     const floatY = Math.sin(time * 0.002 + this.visualOffset) * 5;
     
     ctx.save();
     ctx.translate(this.x, this.y + floatY);
 
-    // Color selection
-    let color = COLORS.platformNormal;
-    if (this.type === 'BOOST') color = COLORS.platformBoost;
-    if (this.type === 'DOUBLE_JUMP_CHARGER') color = COLORS.platformSpecial;
-    if (this.type === 'MOVING') color = COLORS.platformMoving;
-    if (this.type === 'BREAKABLE') color = COLORS.platformBreakable;
+    // --- Planet Rendering ---
+    ctx.globalAlpha = this.type === 'PHANTOM' ? this.opacity : 1.0;
 
-    ctx.shadowBlur = 20;
-    ctx.shadowColor = color;
-    ctx.fillStyle = color;
+    // 1. Base Gradient (Spherical look)
+    const grad = ctx.createRadialGradient(-this.radius * 0.3, -this.radius * 0.3, this.radius * 0.1, 0, 0, this.radius);
+    
+    // Set colors based on type
+    if (this.type === 'NORMAL') { // Ice Planet
+        grad.addColorStop(0, '#aeeeff');
+        grad.addColorStop(0.5, '#00c3ff');
+        grad.addColorStop(1, '#005577');
+    } else if (this.type === 'BOOST') { // Gas Giant (Pink/Magenta)
+        grad.addColorStop(0, '#ff88aa');
+        grad.addColorStop(0.5, '#ff0055');
+        grad.addColorStop(1, '#550022');
+    } else if (this.type === 'DOUBLE_JUMP_CHARGER') { // Golden Star
+        grad.addColorStop(0, '#ffffcc');
+        grad.addColorStop(0.4, '#ffcc00');
+        grad.addColorStop(1, '#aa5500');
+    } else if (this.type === 'MOVING') { // Tech/Artificial (Green)
+        grad.addColorStop(0, '#ccffcc');
+        grad.addColorStop(0.5, '#39ff14');
+        grad.addColorStop(1, '#004400');
+    } else if (this.type === 'BREAKABLE') { // Volcanic/Mars (Red)
+        grad.addColorStop(0, '#ff9999');
+        grad.addColorStop(0.5, '#ff4d4d');
+        grad.addColorStop(1, '#440000');
+    } else if (this.type === 'PHANTOM') { // Nebula (Purple)
+        grad.addColorStop(0, '#eebaff');
+        grad.addColorStop(0.5, '#9d00ff');
+        grad.addColorStop(1, '#220044');
+    } else if (this.type === 'SHRINKING') { // Dying Star (Orange)
+        grad.addColorStop(0, '#ffddaa');
+        grad.addColorStop(0.5, '#ff8800');
+        grad.addColorStop(1, '#551100');
+    }
 
-    // Planet body
+    ctx.fillStyle = grad;
     ctx.beginPath();
     ctx.arc(0, 0, this.radius, 0, Math.PI * 2);
     ctx.fill();
 
-    // Detail (Rings or surface)
-    ctx.shadowBlur = 0;
-    ctx.fillStyle = 'rgba(255,255,255,0.2)';
+    // 2. Texture & Details (Clipped to sphere)
+    ctx.save();
     ctx.beginPath();
-    ctx.arc(-this.radius * 0.3, -this.radius * 0.3, this.radius * 0.2, 0, Math.PI * 2);
+    ctx.arc(0, 0, this.radius, 0, Math.PI * 2);
+    ctx.clip();
+
+    if (this.type === 'NORMAL') {
+        // Ice cracks / continents
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.3)';
+        this.craters.forEach(c => {
+             ctx.beginPath();
+             ctx.arc(c.x, c.y, c.r, 0, Math.PI * 2);
+             ctx.fill();
+        });
+    } else if (this.type === 'BOOST') {
+        // Stripes
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.15)';
+        ctx.save();
+        ctx.rotate(Math.PI / 8);
+        this.stripes.forEach(s => {
+            ctx.fillRect(-this.radius, s.y, this.radius * 2, s.w);
+        });
+        ctx.restore();
+    } else if (this.type === 'BREAKABLE') {
+        // Craters
+        ctx.fillStyle = 'rgba(50, 0, 0, 0.4)';
+        this.craters.forEach(c => {
+            ctx.beginPath();
+            ctx.arc(c.x, c.y, c.r, 0, Math.PI * 2);
+            ctx.fill();
+            // Crater rim highlight
+            ctx.strokeStyle = 'rgba(255,100,100,0.3)';
+            ctx.stroke();
+        });
+    } else if (this.type === 'MOVING') {
+        // Tech lines
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
+        ctx.lineWidth = 1.5;
+        this.techLines.forEach(l => {
+             ctx.beginPath();
+             ctx.moveTo(l.x, l.y);
+             ctx.lineTo(l.x + Math.cos(l.angle) * l.len, l.y + Math.sin(l.angle) * l.len);
+             ctx.stroke();
+        });
+        // Core
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.6)';
+        ctx.beginPath();
+        ctx.arc(0, 0, 5, 0, Math.PI * 2);
+        ctx.fill();
+    } else if (this.type === 'PHANTOM') {
+        // Swirling smoke
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.2)';
+        for(let i=0; i<3; i++) {
+             const angle = time * 0.002 + i * 2;
+             const r = this.radius * 0.5;
+             ctx.beginPath();
+             ctx.arc(Math.cos(angle)*r, Math.sin(angle)*r, 8, 0, Math.PI * 2);
+             ctx.fill();
+        }
+    } else if (this.type === 'SHRINKING') {
+        // Instability
+        ctx.fillStyle = `rgba(255, 255, 0, ${0.2 + Math.sin(time * 0.02) * 0.1})`;
+        ctx.beginPath();
+        ctx.arc(0, 0, this.radius * 0.7, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    
+    // Shine / Gloss for all (atmosphere reflection)
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.1)';
+    ctx.beginPath();
+    ctx.arc(-this.radius * 0.4, -this.radius * 0.4, this.radius * 0.3, 0, Math.PI * 2);
     ctx.fill();
 
-    // Special visuals per type
+    ctx.restore(); // End clip
+
+    // 3. External effects (Rings, Aura, etc)
     if (this.type === 'BOOST') {
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.6)';
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.ellipse(0, 0, this.radius + 8, this.radius * 0.3, Math.PI / 4, 0, Math.PI * 2);
-      ctx.stroke();
+        // Ring
+        ctx.save();
+        ctx.rotate(Math.PI / 8);
+        ctx.beginPath();
+        ctx.ellipse(0, 0, this.radius * 1.6, this.radius * 0.4, 0, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(255, 100, 150, 0.6)';
+        ctx.lineWidth = 3;
+        ctx.stroke();
+        // Back part slightly hidden (simulated by drawing again with composition? Simple is fine for now)
+        ctx.restore();
     } else if (this.type === 'DOUBLE_JUMP_CHARGER') {
-      ctx.fillStyle = '#fff';
-      ctx.font = '12px Orbitron';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText('⚡', 0, 0);
-    } else if (this.type === 'MOVING') {
-      // Draw arrows or orbital lines
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.5)';
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.moveTo(-this.radius + 5, 0);
-      ctx.lineTo(this.radius - 5, 0);
-      ctx.stroke();
-      // Arrow heads
-      ctx.beginPath();
-      ctx.moveTo(-this.radius + 10, -5);
-      ctx.lineTo(-this.radius + 5, 0);
-      ctx.lineTo(-this.radius + 10, 5);
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.moveTo(this.radius - 10, -5);
-      ctx.lineTo(this.radius - 5, 0);
-      ctx.lineTo(this.radius - 10, 5);
-      ctx.stroke();
-    } else if (this.type === 'BREAKABLE') {
-        // Cracks
-        ctx.strokeStyle = 'rgba(50, 0, 0, 0.5)';
+        // Glow pulse
+        const pulse = 1 + Math.sin(time * 0.01) * 0.1;
+        ctx.shadowColor = '#ffcc00';
+        ctx.shadowBlur = 15;
+        ctx.strokeStyle = '#fff';
         ctx.lineWidth = 2;
         ctx.beginPath();
-        ctx.moveTo(-10, -10);
-        ctx.lineTo(5, 5);
-        ctx.lineTo(15, -5);
+        ctx.arc(0, 0, this.radius * pulse, 0, Math.PI * 2);
         ctx.stroke();
+        
+        ctx.shadowBlur = 0;
+        ctx.fillStyle = '#fff';
+        ctx.font = '14px Orbitron';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('⚡', 0, 0);
+    } else if (this.type === 'MOVING') {
+        // Direction arrows
+        ctx.strokeStyle = 'rgba(57, 255, 20, 0.5)';
+        ctx.lineWidth = 2;
         ctx.beginPath();
-        ctx.moveTo(0, 10);
-        ctx.lineTo(-5, 0);
-        ctx.lineTo(-15, 5);
+        ctx.moveTo(this.radius + 5, 0);
+        ctx.lineTo(this.radius + 10, 0);
+        ctx.lineTo(this.radius + 8, -3);
+        ctx.moveTo(this.radius + 10, 0);
+        ctx.lineTo(this.radius + 8, 3);
+        
+        ctx.moveTo(-this.radius - 5, 0);
+        ctx.lineTo(-this.radius - 10, 0);
+        ctx.lineTo(-this.radius - 8, -3);
+        ctx.moveTo(-this.radius - 10, 0);
+        ctx.lineTo(-this.radius - 8, 3);
         ctx.stroke();
     }
 
@@ -219,7 +385,7 @@ class Player {
 
     // Glow
     ctx.shadowBlur = 15;
-    ctx.shadowColor = this.hasDoubleJump ? COLORS.platformSpecial : COLORS.playerEngine;
+    ctx.shadowColor = this.hasDoubleJump ? '#ffcc00' : '#00f2ff';
 
     // Rocket Body
     ctx.fillStyle = COLORS.player;
@@ -233,7 +399,7 @@ class Player {
 
     // Engine Flame (Procedural)
     ctx.shadowBlur = 10;
-    ctx.fillStyle = this.hasDoubleJump ? COLORS.platformSpecial : COLORS.playerEngine;
+    ctx.fillStyle = this.hasDoubleJump ? '#ffcc00' : COLORS.playerEngine;
     const flameHeight = Math.random() * 15 + 10;
     ctx.beginPath();
     ctx.moveTo(-5, this.height / 2 - 2);
@@ -244,7 +410,7 @@ class Player {
 
     // Double Jump Indicator
     if (this.hasDoubleJump) {
-      ctx.strokeStyle = COLORS.platformSpecial;
+      ctx.strokeStyle = '#ffcc00';
       ctx.lineWidth = 2;
       ctx.beginPath();
       ctx.arc(0, 0, this.width, 0, Math.PI * 2);
@@ -261,14 +427,13 @@ const App = () => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [gameState, setGameState] = useState<'START' | 'PLAYING' | 'GAME_OVER'>('START');
   const [score, setScore] = useState(0);
-  const [highScore, setHighScore] = useState(0);
 
   // Game State Refs (mutable for loop)
   const gameRef = useRef({
     player: new Player(0, 0),
     platforms: [] as Platform[],
     particles: [] as Particle[],
-    stars: [] as { x: number; y: number; size: number; alpha: number; speed: number }[],
+    stars: [] as { x: number; y: number; size: number; alpha: number; speed: number; phase: number }[],
     cameraY: 0,
     score: 0,
     input: { left: false, right: false, jump: false },
@@ -284,7 +449,6 @@ const App = () => {
       if (e.code === 'ArrowLeft' || e.code === 'KeyA') gameRef.current.input.left = true;
       if (e.code === 'ArrowRight' || e.code === 'KeyD') gameRef.current.input.right = true;
       if (e.code === 'Space' || e.code === 'ArrowUp') {
-          // Double jump trigger
           triggerDoubleJump();
       }
     };
@@ -333,10 +497,10 @@ const App = () => {
   const triggerDoubleJump = () => {
      if (gameState !== 'PLAYING') return;
      const player = gameRef.current.player;
-     if (player.hasDoubleJump && player.vy > -5) { // Can only double jump if not already shooting up super fast
+     if (player.hasDoubleJump && player.vy > -5) {
          player.vy = JUMP_FORCE * 1.2;
          player.hasDoubleJump = false;
-         createExplosion(player.x, player.y + 15, 10, COLORS.platformSpecial);
+         createExplosion(player.x, player.y + 15, 10, '#ffcc00');
      }
   };
 
@@ -372,15 +536,47 @@ const App = () => {
     const margin = 40;
     const x = margin + Math.random() * (width - margin * 2);
     
-    const rand = Math.random();
     let type: PlatformType = 'NORMAL';
     
-    // Probability distribution
-    if (rand > 0.95) type = 'DOUBLE_JUMP_CHARGER'; // 5%
-    else if (rand > 0.90) type = 'BOOST';          // 5%
-    else if (rand > 0.75) type = 'MOVING';         // 15%
-    else if (rand > 0.65) type = 'BREAKABLE';      // 10%
-    else type = 'NORMAL';                          // 65%
+    // Adjust probabilities based on score (difficulty)
+    const difficulty = Math.min(gameRef.current.score / 5000, 1); // 0 to 1
+    
+    // Base probabilities
+    let pBoost = 0.05;
+    let pDouble = 0.05;
+    let pMoving = 0.1;
+    let pBreak = 0.05;
+    let pPhantom = 0.0;
+    let pShrink = 0.0;
+
+    // Difficulty scaling
+    pMoving += difficulty * 0.15;
+    pBreak += difficulty * 0.1;
+    pPhantom = difficulty > 0.1 ? 0.05 + difficulty * 0.1 : 0;
+    pShrink = difficulty > 0.2 ? 0.05 + difficulty * 0.1 : 0;
+    
+    const r = Math.random();
+    let cumulative = 0;
+
+    cumulative += pDouble;
+    if (r < cumulative) { type = 'DOUBLE_JUMP_CHARGER'; } else {
+      cumulative += pBoost;
+      if (r < cumulative) { type = 'BOOST'; } else {
+        cumulative += pPhantom;
+        if (r < cumulative) { type = 'PHANTOM'; } else {
+            cumulative += pShrink;
+            if (r < cumulative) { type = 'SHRINKING'; } else {
+                cumulative += pMoving;
+                if (r < cumulative) { type = 'MOVING'; } else {
+                    cumulative += pBreak;
+                    if (r < cumulative) { type = 'BREAKABLE'; } else {
+                        type = 'NORMAL';
+                    }
+                }
+            }
+        }
+      }
+    }
 
     gameRef.current.platforms.push(new Platform(x, y, type));
   };
@@ -416,13 +612,14 @@ const App = () => {
       
       // Init stars if empty
       if (gameRef.current.stars.length === 0) {
-        for (let i = 0; i < 100; i++) {
+        for (let i = 0; i < 150; i++) {
             gameRef.current.stars.push({
                 x: Math.random() * canvas.width,
                 y: Math.random() * canvas.height,
-                size: Math.random() * 2,
+                size: Math.random() * 2 + 0.5,
                 alpha: Math.random(),
-                speed: Math.random() * 0.5 + 0.1
+                speed: Math.random() * 0.2 + 0.05,
+                phase: Math.random() * Math.PI * 2
             });
         }
       }
@@ -446,7 +643,7 @@ const App = () => {
       // Player Update
       player.update(input);
 
-      // Platform Update (Moving)
+      // Platform Update (Moving & Special)
       platforms.forEach(p => p.update(width));
 
       // Screen Wrapping
@@ -458,120 +655,113 @@ const App = () => {
         if (player.x > width) { player.x = width; player.vx *= -0.5; }
       }
 
-      // Camera Follow logic (Entities move down, player looks like they go up)
+      // Camera Follow Logic
       if (player.y < height * 0.45) {
         const diff = height * 0.45 - player.y;
         player.y = height * 0.45;
         
-        // Move platforms down
+        // Move everything down
         platforms.forEach(p => p.y += diff);
-        
-        // Move particles down
-        gameRef.current.particles.forEach(p => p.y += diff);
-        
-        // Move Stars (Parallax)
         gameRef.current.stars.forEach(s => {
             s.y += diff * s.speed;
             if (s.y > height) {
-                s.y = 0;
-                s.x = Math.random() * width;
+                s.y -= height;
+                s.x = Math.random() * width; // Respawn randomly x
             }
         });
+        gameRef.current.particles.forEach(p => p.y += diff);
 
-        // Score Calculation (based on distance travelled)
-        gameRef.current.score += Math.floor(diff * 0.1);
+        gameRef.current.score += diff;
         setScore(Math.floor(gameRef.current.score));
 
         // Generate new platforms
         const highestPlatformY = Math.min(...platforms.map(p => p.y));
-        if (highestPlatformY > 100) {
-            generatePlatform(highestPlatformY - (100 + Math.random() * 60));
+        if (highestPlatformY > 50) { // Keep some buffer
+             generatePlatform(highestPlatformY - (100 + Math.random() * 50));
         }
       }
 
-      // Remove old or broken platforms
+      // Cleanup off-screen
       for (let i = platforms.length - 1; i >= 0; i--) {
-        if (platforms[i].y > height || platforms[i].broken) {
-            platforms.splice(i, 1);
-        }
-      }
-
-      // Gravity / Falling Death
-      if (player.y > height) {
-        setHighScore(prev => Math.max(prev, gameRef.current.score));
-        setGameState('GAME_OVER');
+          if (platforms[i].y > height) {
+              platforms.splice(i, 1);
+          }
       }
 
       // Collision Detection
-      // Only check collision if falling
-      if (player.vy > 0) {
-        platforms.forEach(p => {
-            if (p.broken) return;
+      if (player.vy > 0) { // Only when falling
+          platforms.forEach(p => {
+              if (p.isCollidable() && 
+                  player.x > p.x - p.radius - player.width/2 &&
+                  player.x < p.x + p.radius + player.width/2 &&
+                  player.y + player.height/2 >= p.y - p.radius && // Top of platform approx
+                  player.y + player.height/2 <= p.y + p.radius && // Inside platform
+                  player.y - player.vy + player.height/2 <= p.y - 10 // Was above previously (rough check)
+                 ) {
+                  
+                  // Hit!
+                  player.vy = JUMP_FORCE;
+                  createExplosion(player.x, player.y + 15, 5, '#00f2ff');
 
-            // Simple proximity check for circle platform vs point player (bottom of player)
-            // Ideally AABB or Circle-Rect, but since player lands on feet:
-            const distX = player.x - p.x;
-            const distY = (player.y + player.height/2) - (p.y - p.radius * 0.5); // Tune landing spot
-            
-            // Check if within horizontal bounds and vertical bounds
-            if (distX > -(p.radius + 10) && distX < (p.radius + 10) &&
-                distY > -15 && distY < 15) {
-                
-                // Landed!
-                createExplosion(player.x, player.y + player.height/2, 5, COLORS.text);
-                
-                if (p.type === 'BOOST') {
-                    player.vy = SUPER_JUMP_FORCE;
-                    createExplosion(p.x, p.y, 10, COLORS.platformBoost);
-                } else if (p.type === 'DOUBLE_JUMP_CHARGER') {
-                    player.vy = JUMP_FORCE;
-                    player.hasDoubleJump = true;
-                    p.type = 'NORMAL'; 
-                } else if (p.type === 'BREAKABLE') {
-                    player.vy = JUMP_FORCE;
-                    p.broken = true;
-                    createExplosion(p.x, p.y, 8, COLORS.platformBreakable);
-                } else {
-                    player.vy = JUMP_FORCE;
-                }
-            }
-        });
+                  if (p.type === 'BOOST') {
+                      player.vy = SUPER_JUMP_FORCE;
+                      createExplosion(player.x, player.y + 15, 15, '#ff0055');
+                  }
+                  if (p.type === 'DOUBLE_JUMP_CHARGER') {
+                      player.hasDoubleJump = true;
+                      p.type = 'NORMAL'; // Consume the charger
+                  }
+                  if (p.type === 'BREAKABLE') {
+                      p.broken = true;
+                      createExplosion(p.x, p.y, 10, '#ff4d4d');
+                  }
+              }
+          });
       }
 
-      // Particles Update
+      // Particles
       for (let i = gameRef.current.particles.length - 1; i >= 0; i--) {
           const p = gameRef.current.particles[i];
           p.x += p.vx;
           p.y += p.vy;
-          p.life -= 0.02;
-          if (p.life <= 0) gameRef.current.particles.splice(i, 1);
+          p.life -= 0.05;
+          if (p.life <= 0) {
+              gameRef.current.particles.splice(i, 1);
+          }
+      }
+
+      // Game Over
+      if (player.y > height) {
+          setGameState('GAME_OVER');
       }
     };
 
     const draw = (ctx: CanvasRenderingContext2D, time: number) => {
       const { width, height, player, platforms, stars, particles } = gameRef.current;
 
-      // Clear & Background
+      // Background Gradient
       const gradient = ctx.createLinearGradient(0, 0, 0, height);
       gradient.addColorStop(0, COLORS.backgroundTop);
       gradient.addColorStop(1, COLORS.backgroundBottom);
       ctx.fillStyle = gradient;
       ctx.fillRect(0, 0, width, height);
 
-      // Draw Stars
-      ctx.fillStyle = '#ffffff';
+      // Stars
       stars.forEach(s => {
-          ctx.globalAlpha = Math.abs(Math.sin(time * 0.001 * s.speed + s.x)) * s.alpha;
+          // Twinkle effect
+          const alpha = s.alpha * (0.6 + Math.sin(time * 0.002 + s.phase) * 0.4);
+          ctx.globalAlpha = alpha;
+          ctx.fillStyle = '#ffffff';
           ctx.beginPath();
           ctx.arc(s.x, s.y, s.size, 0, Math.PI * 2);
           ctx.fill();
       });
       ctx.globalAlpha = 1.0;
 
-      // Draw Platforms
+      // Platforms
       platforms.forEach(p => p.draw(ctx, time));
 
-      // Draw Particles
+      // Particles
       particles.forEach(p => {
           ctx.globalAlpha = p.life;
           ctx.fillStyle = p.color;
@@ -581,10 +771,8 @@ const App = () => {
       });
       ctx.globalAlpha = 1.0;
 
-      // Draw Player (Only if playing or game over but still visible)
-      if (gameState !== 'START') {
-        player.draw(ctx);
-      }
+      // Player
+      player.draw(ctx);
     };
 
     animationId = requestAnimationFrame(loop);
@@ -592,31 +780,22 @@ const App = () => {
   }, [gameState]);
 
   return (
-    <div style={{ position: 'relative', width: '100%', height: '100%' }}>
-      <canvas
-        ref={canvasRef}
-        style={{ display: 'block', touchAction: 'none' }}
-      />
+    <div style={{ width: '100%', height: '100%', position: 'relative' }}>
+      <canvas ref={canvasRef} style={{ display: 'block' }} />
       
       {/* HUD */}
       {gameState === 'PLAYING' && (
-        <div style={{
-          position: 'absolute',
-          top: 20,
-          left: 20,
-          fontFamily: 'Orbitron',
-          fontSize: '24px',
-          color: COLORS.text,
-          textShadow: '0 0 10px cyan',
-          pointerEvents: 'none',
-        }}>
-          ALTITUDE: {score}
-          {gameRef.current.player.hasDoubleJump && (
-            <div style={{ fontSize: '14px', color: COLORS.platformSpecial, marginTop: '4px' }}>
-              DOUBLE JUMP READY (TAP/SPACE)
-            </div>
-          )}
-        </div>
+          <div style={{
+              position: 'absolute',
+              top: 20,
+              left: 20,
+              color: COLORS.text,
+              fontFamily: 'Orbitron, sans-serif',
+              fontSize: '24px',
+              textShadow: '0 0 10px #00f2ff'
+          }}>
+              高度: {Math.floor(score)} M
+          </div>
       )}
 
       {/* Start Screen */}
@@ -624,38 +803,21 @@ const App = () => {
         <div style={{
           position: 'absolute',
           top: 0, left: 0, width: '100%', height: '100%',
-          display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
           backgroundColor: COLORS.uiOverlay,
-          backdropFilter: 'blur(5px)'
-        }}>
-          <h1 style={{ fontFamily: 'Orbitron', fontSize: '48px', margin: '0 0 20px 0', textShadow: '0 0 20px #00f2ff' }}>
-            ASTRO LEAP
-          </h1>
-          <p style={{ fontFamily: 'Rajdhani', fontSize: '18px', maxWidth: '300px', textAlign: 'center', lineHeight: '1.5' }}>
-            Tap Left/Right to Move.<br/>
-            Land on glowing planets.<br/>
-            <span style={{color: COLORS.platformBoost}}>Magenta</span> = Super Jump<br/>
-            <span style={{color: COLORS.platformSpecial}}>Yellow</span> = Charge Double Jump<br/>
-            <span style={{color: COLORS.platformMoving}}>Green</span> = Moving<br/>
-            <span style={{color: COLORS.platformBreakable}}>Red</span> = Breakable
-          </p>
-          <button 
-            onClick={initGame}
-            style={{
-              marginTop: '30px',
-              padding: '15px 40px',
-              fontSize: '24px',
-              fontFamily: 'Orbitron',
-              background: 'linear-gradient(45deg, #00f2ff, #0099ff)',
-              border: 'none',
-              borderRadius: '30px',
-              color: 'white',
-              cursor: 'pointer',
-              boxShadow: '0 0 20px rgba(0, 242, 255, 0.5)'
-            }}
-          >
-            LAUNCH
-          </button>
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          justifyContent: 'center',
+          color: COLORS.text,
+          textAlign: 'center',
+          zIndex: 10
+        }} onClick={initGame}>
+          <h1 style={{ fontFamily: 'Orbitron, sans-serif', fontSize: '48px', margin: '0 0 20px 0', textShadow: '0 0 20px #00f2ff' }}>ASTRO LEAP</h1>
+          <p style={{ fontFamily: 'Rajdhani, sans-serif', fontSize: '24px', letterSpacing: '2px' }}>タップして発進</p>
+          <div style={{ marginTop: '40px', fontSize: '16px', opacity: 0.8, fontFamily: 'Rajdhani, sans-serif' }}>
+            <p>画面左右タップで移動</p>
+            <p>特殊な惑星を見極めろ</p>
+          </div>
         </div>
       )}
 
@@ -664,31 +826,36 @@ const App = () => {
         <div style={{
           position: 'absolute',
           top: 0, left: 0, width: '100%', height: '100%',
-          display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
-          backgroundColor: COLORS.uiOverlay,
-          backdropFilter: 'blur(5px)'
-        }}>
-          <h2 style={{ fontFamily: 'Orbitron', fontSize: '42px', color: '#ff0055', textShadow: '0 0 20px red' }}>
-            SIGNAL LOST
-          </h2>
-          <div style={{ fontSize: '24px', marginBottom: '10px' }}>SCORE: {score}</div>
-          <div style={{ fontSize: '18px', color: '#aaa', marginBottom: '30px' }}>BEST: {highScore}</div>
+          backgroundColor: 'rgba(20, 0, 0, 0.9)',
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          justifyContent: 'center',
+          color: COLORS.text,
+          textAlign: 'center',
+          zIndex: 10
+        }} onClick={initGame}>
+          <h1 style={{ fontFamily: 'Orbitron, sans-serif', fontSize: '48px', color: '#ff4d4d', margin: '0 0 10px 0', textShadow: '0 0 20px #ff0000' }}>通信途絶</h1>
+          <h2 style={{ fontFamily: 'Rajdhani, sans-serif', fontSize: '20px', letterSpacing: '5px', marginBottom: '40px' }}>SIGNAL LOST</h2>
           
-          <button 
-            onClick={initGame}
-            style={{
-              padding: '15px 40px',
-              fontSize: '24px',
-              fontFamily: 'Orbitron',
+          <div style={{ marginBottom: '40px' }}>
+              <p style={{ fontSize: '16px', color: '#aaa' }}>最終到達高度</p>
+              <p style={{ fontFamily: 'Orbitron, sans-serif', fontSize: '42px', margin: '10px 0', color: '#fff' }}>{Math.floor(score)} M</p>
+          </div>
+
+          <button style={{
               background: 'transparent',
-              border: '2px solid white',
-              borderRadius: '30px',
-              color: 'white',
+              border: '2px solid #fff',
+              color: '#fff',
+              padding: '15px 40px',
+              fontFamily: 'Rajdhani, sans-serif',
+              fontSize: '20px',
               cursor: 'pointer',
-              transition: 'all 0.2s'
-            }}
-          >
-            RETRY
+              textTransform: 'uppercase',
+              letterSpacing: '2px',
+              boxShadow: '0 0 15px rgba(255,255,255,0.3)'
+          }}>
+              システム再起動 (RETRY)
           </button>
         </div>
       )}
@@ -696,5 +863,6 @@ const App = () => {
   );
 };
 
-const root = createRoot(document.getElementById('root')!);
+const container = document.getElementById('root');
+const root = createRoot(container!);
 root.render(<App />);
