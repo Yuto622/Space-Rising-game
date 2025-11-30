@@ -2,10 +2,12 @@ import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 
 // --- Constants & Config ---
-const GRAVITY = 0.4;
-const JUMP_FORCE = -13;
-const SUPER_JUMP_FORCE = -22;
-const FRICTION = 0.9;
+// Super slow physics for "deep space/moon" feel
+const GRAVITY = 0.08; 
+const JUMP_FORCE = -6.0; 
+const SUPER_JUMP_FORCE = -10.0; 
+const FRICTION = 0.98; // Very slippery (vacuum)
+const ACCEL = 0.15; // Slightly more control than before (was 0.12)
 const SCREEN_WRAP = true;
 
 const COLORS = {
@@ -15,6 +17,96 @@ const COLORS = {
   playerEngine: '#00f2ff',
   text: '#ffffff',
   uiOverlay: 'rgba(0, 0, 0, 0.85)',
+};
+
+// --- Sound Synthesizer ---
+const sfx = {
+  ctx: null as AudioContext | null,
+  init: () => {
+    if (!sfx.ctx) {
+      sfx.ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+    }
+    if (sfx.ctx.state === 'suspended') {
+      sfx.ctx.resume();
+    }
+  },
+  play: (type: 'JUMP' | 'BOOST' | 'DOUBLE_JUMP' | 'EXPLOSION' | 'POWERUP' | 'GAME_OVER' | 'BREAK') => {
+    if (!sfx.ctx) return;
+    const ctx = sfx.ctx;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    
+    const now = ctx.currentTime;
+
+    switch (type) {
+      case 'JUMP':
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(150, now);
+        osc.frequency.exponentialRampToValueAtTime(400, now + 0.2);
+        gain.gain.setValueAtTime(0.1, now);
+        gain.gain.linearRampToValueAtTime(0, now + 0.2);
+        osc.start(now);
+        osc.stop(now + 0.2);
+        break;
+      case 'BOOST':
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(200, now);
+        osc.frequency.exponentialRampToValueAtTime(800, now + 0.8); // Longer sound
+        gain.gain.setValueAtTime(0.1, now);
+        gain.gain.linearRampToValueAtTime(0, now + 0.8);
+        osc.start(now);
+        osc.stop(now + 0.8);
+        break;
+      case 'DOUBLE_JUMP':
+        osc.type = 'square';
+        osc.frequency.setValueAtTime(300, now);
+        osc.frequency.exponentialRampToValueAtTime(600, now + 0.2);
+        gain.gain.setValueAtTime(0.05, now);
+        gain.gain.linearRampToValueAtTime(0, now + 0.2);
+        osc.start(now);
+        osc.stop(now + 0.2);
+        break;
+      case 'POWERUP':
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(880, now);
+        osc.frequency.setValueAtTime(1760, now + 0.1);
+        gain.gain.setValueAtTime(0.05, now);
+        gain.gain.linearRampToValueAtTime(0, now + 0.3);
+        osc.start(now);
+        osc.stop(now + 0.3);
+        break;
+      case 'EXPLOSION': // Simple low rumble
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(80, now);
+        osc.frequency.exponentialRampToValueAtTime(10, now + 0.8);
+        gain.gain.setValueAtTime(0.2, now);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.8);
+        osc.start(now);
+        osc.stop(now + 0.8);
+        break;
+      case 'BREAK':
+        osc.type = 'square';
+        osc.frequency.setValueAtTime(120, now);
+        osc.frequency.exponentialRampToValueAtTime(40, now + 0.3);
+        gain.gain.setValueAtTime(0.1, now);
+        gain.gain.linearRampToValueAtTime(0, now + 0.3);
+        osc.start(now);
+        osc.stop(now + 0.3);
+        break;
+      case 'GAME_OVER':
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(300, now);
+        osc.frequency.linearRampToValueAtTime(30, now + 2.0);
+        gain.gain.setValueAtTime(0.2, now);
+        gain.gain.linearRampToValueAtTime(0, now + 2.0);
+        osc.start(now);
+        osc.stop(now + 2.0);
+        break;
+    }
+  }
 };
 
 // --- Types ---
@@ -29,7 +121,136 @@ type Particle = {
   color: string;
   size: number;
 };
-type PlatformType = 'NORMAL' | 'BOOST' | 'DOUBLE_JUMP_CHARGER' | 'MOVING' | 'BREAKABLE' | 'PHANTOM' | 'SHRINKING';
+type PlatformType = 'NORMAL' | 'BOOST' | 'DOUBLE_JUMP_CHARGER' | 'MOVING' | 'BREAKABLE' | 'PHANTOM' | 'SHRINKING' | 'START';
+type ObstacleType = 'UFO' | 'BLACK_HOLE';
+
+class Obstacle {
+    x: number;
+    y: number;
+    radius: number;
+    type: ObstacleType;
+    vx: number = 0;
+    angle: number = 0;
+
+    constructor(x: number, y: number, type: ObstacleType) {
+        this.x = x;
+        this.y = y;
+        this.type = type;
+        this.angle = Math.random() * Math.PI * 2;
+
+        if (type === 'UFO') {
+            this.radius = 25;
+            this.vx = (Math.random() - 0.5) * 0.5; // Very slow UFO
+        } else {
+            this.radius = 40; // Black hole event horizon size roughly
+        }
+    }
+
+    update(width: number, player: Player) {
+        this.angle += 0.02; // Slower animation
+
+        if (this.type === 'UFO') {
+            this.x += this.vx;
+            // Hover effect
+            this.y += Math.sin(this.angle) * 0.2;
+
+            // Bounce off walls
+            if (this.x < this.radius) {
+                this.x = this.radius;
+                this.vx *= -1;
+            }
+            if (this.x > width - this.radius) {
+                this.x = width - this.radius;
+                this.vx *= -1;
+            }
+        }
+        // Black holes are stationary but exert gravity (handled in main loop)
+    }
+
+    draw(ctx: CanvasRenderingContext2D, time: number) {
+        ctx.save();
+        ctx.translate(this.x, this.y);
+
+        if (this.type === 'UFO') {
+            // Hover wobble
+            const wobble = Math.sin(time * 0.002) * 4;
+            ctx.translate(0, wobble);
+
+            // Dome
+            ctx.fillStyle = 'rgba(100, 255, 255, 0.6)';
+            ctx.beginPath();
+            ctx.arc(0, -5, 12, Math.PI, 0);
+            ctx.fill();
+
+            // Body
+            const grad = ctx.createLinearGradient(-25, 0, 25, 0);
+            grad.addColorStop(0, '#555');
+            grad.addColorStop(0.5, '#ccc');
+            grad.addColorStop(1, '#555');
+            ctx.fillStyle = grad;
+            ctx.beginPath();
+            ctx.ellipse(0, 0, 25, 10, 0, 0, Math.PI * 2);
+            ctx.fill();
+            
+            // Lights
+            for(let i=0; i<5; i++) {
+                const angle = (time * 0.002) + (i * (Math.PI * 2) / 5);
+                const lx = Math.cos(angle) * 18;
+                const ly = Math.sin(angle) * 4;
+                // Only draw front lights
+                if (Math.sin(angle) > 0) {
+                     ctx.fillStyle = i % 2 === 0 ? '#ff0000' : '#ffff00';
+                     ctx.beginPath();
+                     ctx.arc(lx, ly + 2, 3, 0, Math.PI * 2);
+                     ctx.fill();
+                }
+            }
+            
+            // Beam (faint)
+            ctx.fillStyle = 'rgba(0, 255, 0, 0.1)';
+            ctx.beginPath();
+            ctx.moveTo(-10, 5);
+            ctx.lineTo(-20, 40);
+            ctx.arc(0, 40, 20, 0, Math.PI, false); // Bottom arc
+            ctx.lineTo(20, 40);
+            ctx.lineTo(10, 5);
+            ctx.fill();
+
+        } else if (this.type === 'BLACK_HOLE') {
+            // Event Horizon
+            ctx.fillStyle = '#000';
+            ctx.shadowColor = '#8000ff';
+            ctx.shadowBlur = 20 + Math.sin(time * 0.005) * 10;
+            ctx.beginPath();
+            ctx.arc(0, 0, 15, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.shadowBlur = 0;
+
+            // Accretion Disk (Swirling)
+            ctx.rotate(time * 0.0005);
+            const grad = ctx.createRadialGradient(0, 0, 15, 0, 0, 50);
+            grad.addColorStop(0, 'rgba(128, 0, 255, 0.8)');
+            grad.addColorStop(0.4, 'rgba(255, 0, 128, 0.3)');
+            grad.addColorStop(1, 'rgba(0, 0, 0, 0)');
+            
+            ctx.fillStyle = grad;
+            ctx.beginPath();
+            // Irregular swirl shape
+            for(let i=0; i<=20; i++) {
+                const angle = (i / 20) * Math.PI * 2;
+                const r = 40 + Math.sin(angle * 5 + time * 0.005) * 5;
+                const x = Math.cos(angle) * r;
+                const y = Math.sin(angle) * r;
+                if (i===0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            }
+            ctx.closePath();
+            ctx.fill();
+        }
+
+        ctx.restore();
+    }
+}
 
 class Platform {
   x: number;
@@ -66,7 +287,7 @@ class Platform {
     // Type specific config & Visual Gen
     switch (type) {
       case 'NORMAL':
-        this.radius = 30;
+        this.radius = 35; // Larger (Easier)
         // Ice patches
         for (let i = 0; i < 3; i++) {
            this.craters.push({
@@ -76,8 +297,11 @@ class Platform {
            });
         }
         break;
+      case 'START':
+        this.radius = 120; // Very wide
+        break;
       case 'BOOST':
-        this.radius = 25;
+        this.radius = 30; // Larger (Easier)
         // Gas giant stripes
         for (let i = 0; i < 4; i++) {
             this.stripes.push({
@@ -87,11 +311,11 @@ class Platform {
         }
         break;
       case 'DOUBLE_JUMP_CHARGER':
-        this.radius = 20;
+        this.radius = 25; // Larger (Easier)
         break;
       case 'MOVING':
-        this.radius = 28;
-        this.vx = (Math.random() > 0.5 ? 1 : -1) * (2 + Math.random() * 1.5);
+        this.radius = 32;
+        this.vx = (Math.random() > 0.5 ? 1 : -1) * (0.4 + Math.random() * 0.3); // Very Slower movement
         // Tech lines
         for(let i=0; i<6; i++) {
             this.techLines.push({
@@ -103,7 +327,7 @@ class Platform {
         }
         break;
       case 'BREAKABLE':
-        this.radius = 28;
+        this.radius = 32;
         // Craters
         for (let i = 0; i < 4; i++) {
             this.craters.push({
@@ -114,19 +338,19 @@ class Platform {
         }
         break;
       case 'PHANTOM':
-        this.radius = 28;
+        this.radius = 32;
         break;
       case 'SHRINKING':
-        this.radius = 35; // Start slightly larger
-        this.shrinkRate = 0.03 + Math.random() * 0.03;
+        this.radius = 40; // Start larger (Easier)
+        this.shrinkRate = 0.005 + Math.random() * 0.005; // Very Slower shrinking
         break;
       default:
-        this.radius = 30;
+        this.radius = 35;
     }
   }
 
   update(width: number) {
-    this.rotationAngle += 0.01; // Slowly rotate visuals
+    this.rotationAngle += 0.003; // Slower rotation
 
     if (this.type === 'MOVING') {
       this.x += this.vx;
@@ -140,7 +364,7 @@ class Platform {
         this.vx *= -1;
       }
     } else if (this.type === 'PHANTOM') {
-        this.phantomPhase += 0.05;
+        this.phantomPhase += 0.015; // Slower phasing
         // Opacity follows a sine wave, clamped
         const val = Math.sin(this.phantomPhase);
         // Be solid for 60% of time, fade out quickly
@@ -166,7 +390,7 @@ class Platform {
     if (this.broken) return;
     if (this.radius <= 0) return;
 
-    const floatY = Math.sin(time * 0.002 + this.visualOffset) * 5;
+    const floatY = this.type === 'START' ? 0 : Math.sin(time * 0.001 + this.visualOffset) * 5;
     
     ctx.save();
     ctx.translate(this.x, this.y + floatY);
@@ -174,166 +398,196 @@ class Platform {
     // --- Planet Rendering ---
     ctx.globalAlpha = this.type === 'PHANTOM' ? this.opacity : 1.0;
 
-    // 1. Base Gradient (Spherical look)
-    const grad = ctx.createRadialGradient(-this.radius * 0.3, -this.radius * 0.3, this.radius * 0.1, 0, 0, this.radius);
-    
-    // Set colors based on type
-    if (this.type === 'NORMAL') { // Ice Planet
-        grad.addColorStop(0, '#aeeeff');
-        grad.addColorStop(0.5, '#00c3ff');
-        grad.addColorStop(1, '#005577');
-    } else if (this.type === 'BOOST') { // Gas Giant (Pink/Magenta)
-        grad.addColorStop(0, '#ff88aa');
-        grad.addColorStop(0.5, '#ff0055');
-        grad.addColorStop(1, '#550022');
-    } else if (this.type === 'DOUBLE_JUMP_CHARGER') { // Golden Star
-        grad.addColorStop(0, '#ffffcc');
-        grad.addColorStop(0.4, '#ffcc00');
-        grad.addColorStop(1, '#aa5500');
-    } else if (this.type === 'MOVING') { // Tech/Artificial (Green)
-        grad.addColorStop(0, '#ccffcc');
-        grad.addColorStop(0.5, '#39ff14');
-        grad.addColorStop(1, '#004400');
-    } else if (this.type === 'BREAKABLE') { // Volcanic/Mars (Red)
-        grad.addColorStop(0, '#ff9999');
-        grad.addColorStop(0.5, '#ff4d4d');
-        grad.addColorStop(1, '#440000');
-    } else if (this.type === 'PHANTOM') { // Nebula (Purple)
-        grad.addColorStop(0, '#eebaff');
-        grad.addColorStop(0.5, '#9d00ff');
-        grad.addColorStop(1, '#220044');
-    } else if (this.type === 'SHRINKING') { // Dying Star (Orange)
-        grad.addColorStop(0, '#ffddaa');
-        grad.addColorStop(0.5, '#ff8800');
-        grad.addColorStop(1, '#551100');
-    }
-
-    ctx.fillStyle = grad;
-    ctx.beginPath();
-    ctx.arc(0, 0, this.radius, 0, Math.PI * 2);
-    ctx.fill();
-
-    // 2. Texture & Details (Clipped to sphere)
-    ctx.save();
-    ctx.beginPath();
-    ctx.arc(0, 0, this.radius, 0, Math.PI * 2);
-    ctx.clip();
-
-    if (this.type === 'NORMAL') {
-        // Ice cracks / continents
-        ctx.fillStyle = 'rgba(255, 255, 255, 0.3)';
-        this.craters.forEach(c => {
-             ctx.beginPath();
-             ctx.arc(c.x, c.y, c.r, 0, Math.PI * 2);
-             ctx.fill();
-        });
-    } else if (this.type === 'BOOST') {
-        // Stripes
-        ctx.fillStyle = 'rgba(0, 0, 0, 0.15)';
-        ctx.save();
-        ctx.rotate(Math.PI / 8);
-        this.stripes.forEach(s => {
-            ctx.fillRect(-this.radius, s.y, this.radius * 2, s.w);
-        });
-        ctx.restore();
-    } else if (this.type === 'BREAKABLE') {
-        // Craters
-        ctx.fillStyle = 'rgba(50, 0, 0, 0.4)';
-        this.craters.forEach(c => {
-            ctx.beginPath();
-            ctx.arc(c.x, c.y, c.r, 0, Math.PI * 2);
-            ctx.fill();
-            // Crater rim highlight
-            ctx.strokeStyle = 'rgba(255,100,100,0.3)';
-            ctx.stroke();
-        });
-    } else if (this.type === 'MOVING') {
-        // Tech lines
-        ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
-        ctx.lineWidth = 1.5;
-        this.techLines.forEach(l => {
-             ctx.beginPath();
-             ctx.moveTo(l.x, l.y);
-             ctx.lineTo(l.x + Math.cos(l.angle) * l.len, l.y + Math.sin(l.angle) * l.len);
-             ctx.stroke();
-        });
-        // Core
-        ctx.fillStyle = 'rgba(255, 255, 255, 0.6)';
+    if (this.type === 'START') {
+        // Draw Launchpad (Flat)
+        ctx.fillStyle = '#444';
+        ctx.shadowBlur = 10;
+        ctx.shadowColor = '#00f2ff';
+        
+        // Main platform
         ctx.beginPath();
-        ctx.arc(0, 0, 5, 0, Math.PI * 2);
+        ctx.roundRect(-this.radius, -10, this.radius * 2, 20, 5);
         ctx.fill();
-    } else if (this.type === 'PHANTOM') {
-        // Swirling smoke
-        ctx.fillStyle = 'rgba(255, 255, 255, 0.2)';
+
+        // Glow lines
+        ctx.strokeStyle = '#00f2ff';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(-this.radius + 10, -10);
+        ctx.lineTo(this.radius - 10, -10);
+        ctx.stroke();
+
+        // Launch markers
+        ctx.fillStyle = '#00f2ff';
         for(let i=0; i<3; i++) {
-             const angle = time * 0.002 + i * 2;
-             const r = this.radius * 0.5;
-             ctx.beginPath();
-             ctx.arc(Math.cos(angle)*r, Math.sin(angle)*r, 8, 0, Math.PI * 2);
-             ctx.fill();
+            ctx.beginPath();
+            ctx.moveTo(-10 + i * 10, -10);
+            ctx.lineTo(-5 + i * 10, -20);
+            ctx.lineTo(0 + i * 10, -10);
+            ctx.fill();
         }
-    } else if (this.type === 'SHRINKING') {
-        // Instability
-        ctx.fillStyle = `rgba(255, 255, 0, ${0.2 + Math.sin(time * 0.02) * 0.1})`;
+        
+    } else {
+        // Spherical Planets
+        const grad = ctx.createRadialGradient(-this.radius * 0.3, -this.radius * 0.3, this.radius * 0.1, 0, 0, this.radius);
+        
+        // Set colors based on type
+        if (this.type === 'NORMAL') { // Ice Planet
+            grad.addColorStop(0, '#aeeeff');
+            grad.addColorStop(0.5, '#00c3ff');
+            grad.addColorStop(1, '#005577');
+        } else if (this.type === 'BOOST') { // Gas Giant (Pink/Magenta)
+            grad.addColorStop(0, '#ff88aa');
+            grad.addColorStop(0.5, '#ff0055');
+            grad.addColorStop(1, '#550022');
+        } else if (this.type === 'DOUBLE_JUMP_CHARGER') { // Golden Star
+            grad.addColorStop(0, '#ffffcc');
+            grad.addColorStop(0.4, '#ffcc00');
+            grad.addColorStop(1, '#aa5500');
+        } else if (this.type === 'MOVING') { // Tech/Artificial (Green)
+            grad.addColorStop(0, '#ccffcc');
+            grad.addColorStop(0.5, '#39ff14');
+            grad.addColorStop(1, '#004400');
+        } else if (this.type === 'BREAKABLE') { // Volcanic/Mars (Red)
+            grad.addColorStop(0, '#ff9999');
+            grad.addColorStop(0.5, '#ff4d4d');
+            grad.addColorStop(1, '#440000');
+        } else if (this.type === 'PHANTOM') { // Nebula (Purple)
+            grad.addColorStop(0, '#eebaff');
+            grad.addColorStop(0.5, '#9d00ff');
+            grad.addColorStop(1, '#220044');
+        } else if (this.type === 'SHRINKING') { // Dying Star (Orange)
+            grad.addColorStop(0, '#ffddaa');
+            grad.addColorStop(0.5, '#ff8800');
+            grad.addColorStop(1, '#551100');
+        }
+
+        ctx.fillStyle = grad;
         ctx.beginPath();
-        ctx.arc(0, 0, this.radius * 0.7, 0, Math.PI * 2);
+        ctx.arc(0, 0, this.radius, 0, Math.PI * 2);
         ctx.fill();
-    }
-    
-    // Shine / Gloss for all (atmosphere reflection)
-    ctx.fillStyle = 'rgba(255, 255, 255, 0.1)';
-    ctx.beginPath();
-    ctx.arc(-this.radius * 0.4, -this.radius * 0.4, this.radius * 0.3, 0, Math.PI * 2);
-    ctx.fill();
 
-    ctx.restore(); // End clip
-
-    // 3. External effects (Rings, Aura, etc)
-    if (this.type === 'BOOST') {
-        // Ring
+        // 2. Texture & Details (Clipped to sphere)
         ctx.save();
-        ctx.rotate(Math.PI / 8);
         ctx.beginPath();
-        ctx.ellipse(0, 0, this.radius * 1.6, this.radius * 0.4, 0, 0, Math.PI * 2);
-        ctx.strokeStyle = 'rgba(255, 100, 150, 0.6)';
-        ctx.lineWidth = 3;
-        ctx.stroke();
-        // Back part slightly hidden (simulated by drawing again with composition? Simple is fine for now)
-        ctx.restore();
-    } else if (this.type === 'DOUBLE_JUMP_CHARGER') {
-        // Glow pulse
-        const pulse = 1 + Math.sin(time * 0.01) * 0.1;
-        ctx.shadowColor = '#ffcc00';
-        ctx.shadowBlur = 15;
-        ctx.strokeStyle = '#fff';
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.arc(0, 0, this.radius * pulse, 0, Math.PI * 2);
-        ctx.stroke();
+        ctx.arc(0, 0, this.radius, 0, Math.PI * 2);
+        ctx.clip();
+
+        if (this.type === 'NORMAL') {
+            // Ice cracks / continents
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.3)';
+            this.craters.forEach(c => {
+                ctx.beginPath();
+                ctx.arc(c.x, c.y, c.r, 0, Math.PI * 2);
+                ctx.fill();
+            });
+        } else if (this.type === 'BOOST') {
+            // Stripes
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.15)';
+            ctx.save();
+            ctx.rotate(Math.PI / 8);
+            this.stripes.forEach(s => {
+                ctx.fillRect(-this.radius, s.y, this.radius * 2, s.w);
+            });
+            ctx.restore();
+        } else if (this.type === 'BREAKABLE') {
+            // Craters
+            ctx.fillStyle = 'rgba(50, 0, 0, 0.4)';
+            this.craters.forEach(c => {
+                ctx.beginPath();
+                ctx.arc(c.x, c.y, c.r, 0, Math.PI * 2);
+                ctx.fill();
+                // Crater rim highlight
+                ctx.strokeStyle = 'rgba(255,100,100,0.3)';
+                ctx.stroke();
+            });
+        } else if (this.type === 'MOVING') {
+            // Tech lines
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
+            ctx.lineWidth = 1.5;
+            this.techLines.forEach(l => {
+                ctx.beginPath();
+                ctx.moveTo(l.x, l.y);
+                ctx.lineTo(l.x + Math.cos(l.angle) * l.len, l.y + Math.sin(l.angle) * l.len);
+                ctx.stroke();
+            });
+            // Core
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.6)';
+            ctx.beginPath();
+            ctx.arc(0, 0, 5, 0, Math.PI * 2);
+            ctx.fill();
+        } else if (this.type === 'PHANTOM') {
+            // Swirling smoke
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.2)';
+            for(let i=0; i<3; i++) {
+                const angle = time * 0.001 + i * 2;
+                const r = this.radius * 0.5;
+                ctx.beginPath();
+                ctx.arc(Math.cos(angle)*r, Math.sin(angle)*r, 8, 0, Math.PI * 2);
+                ctx.fill();
+            }
+        } else if (this.type === 'SHRINKING') {
+            // Instability
+            ctx.fillStyle = `rgba(255, 255, 0, ${0.2 + Math.sin(time * 0.01) * 0.1})`;
+            ctx.beginPath();
+            ctx.arc(0, 0, this.radius * 0.7, 0, Math.PI * 2);
+            ctx.fill();
+        }
         
-        ctx.shadowBlur = 0;
-        ctx.fillStyle = '#fff';
-        ctx.font = '14px Orbitron';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillText('⚡', 0, 0);
-    } else if (this.type === 'MOVING') {
-        // Direction arrows
-        ctx.strokeStyle = 'rgba(57, 255, 20, 0.5)';
-        ctx.lineWidth = 2;
+        // Shine / Gloss for all (atmosphere reflection)
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.1)';
         ctx.beginPath();
-        ctx.moveTo(this.radius + 5, 0);
-        ctx.lineTo(this.radius + 10, 0);
-        ctx.lineTo(this.radius + 8, -3);
-        ctx.moveTo(this.radius + 10, 0);
-        ctx.lineTo(this.radius + 8, 3);
-        
-        ctx.moveTo(-this.radius - 5, 0);
-        ctx.lineTo(-this.radius - 10, 0);
-        ctx.lineTo(-this.radius - 8, -3);
-        ctx.moveTo(-this.radius - 10, 0);
-        ctx.lineTo(-this.radius - 8, 3);
-        ctx.stroke();
+        ctx.arc(-this.radius * 0.4, -this.radius * 0.4, this.radius * 0.3, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.restore(); // End clip
+
+        // 3. External effects (Rings, Aura, etc)
+        if (this.type === 'BOOST') {
+            // Ring
+            ctx.save();
+            ctx.rotate(Math.PI / 8);
+            ctx.beginPath();
+            ctx.ellipse(0, 0, this.radius * 1.6, this.radius * 0.4, 0, 0, Math.PI * 2);
+            ctx.strokeStyle = 'rgba(255, 100, 150, 0.6)';
+            ctx.lineWidth = 3;
+            ctx.stroke();
+            ctx.restore();
+        } else if (this.type === 'DOUBLE_JUMP_CHARGER') {
+            // Glow pulse
+            const pulse = 1 + Math.sin(time * 0.005) * 0.1;
+            ctx.shadowColor = '#ffcc00';
+            ctx.shadowBlur = 15;
+            ctx.strokeStyle = '#fff';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.arc(0, 0, this.radius * pulse, 0, Math.PI * 2);
+            ctx.stroke();
+            
+            ctx.shadowBlur = 0;
+            ctx.fillStyle = '#fff';
+            ctx.font = '14px Orbitron';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText('⚡', 0, 0);
+        } else if (this.type === 'MOVING') {
+            // Direction arrows
+            ctx.strokeStyle = 'rgba(57, 255, 20, 0.5)';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(this.radius + 5, 0);
+            ctx.lineTo(this.radius + 10, 0);
+            ctx.lineTo(this.radius + 8, -3);
+            ctx.moveTo(this.radius + 10, 0);
+            ctx.lineTo(this.radius + 8, 3);
+            
+            ctx.moveTo(-this.radius - 5, 0);
+            ctx.lineTo(-this.radius - 10, 0);
+            ctx.lineTo(-this.radius - 8, -3);
+            ctx.moveTo(-this.radius - 10, 0);
+            ctx.lineTo(-this.radius - 8, 3);
+            ctx.stroke();
+        }
     }
 
     ctx.restore();
@@ -359,15 +613,15 @@ class Player {
 
   update(input: { left: boolean; right: boolean }) {
     // Movement
-    if (input.left) this.vx -= 0.8;
-    if (input.right) this.vx += 0.8;
+    if (input.left) this.vx -= ACCEL;
+    if (input.right) this.vx += ACCEL;
 
     // Friction
     this.vx *= FRICTION;
 
     // Velocity Cap
-    if (this.vx > 10) this.vx = 10;
-    if (this.vx < -10) this.vx = -10;
+    if (this.vx > 5) this.vx = 5; // Faster max speed for easier control
+    if (this.vx < -5) this.vx = -5;
 
     // Apply Physics
     this.x += this.vx;
@@ -432,6 +686,7 @@ const App = () => {
   const gameRef = useRef({
     player: new Player(0, 0),
     platforms: [] as Platform[],
+    obstacles: [] as Obstacle[],
     particles: [] as Particle[],
     stars: [] as { x: number; y: number; size: number; alpha: number; speed: number; phase: number }[],
     cameraY: 0,
@@ -497,29 +752,35 @@ const App = () => {
   const triggerDoubleJump = () => {
      if (gameState !== 'PLAYING') return;
      const player = gameRef.current.player;
-     if (player.hasDoubleJump && player.vy > -5) {
+     if (player.hasDoubleJump && player.vy > -3) {
          player.vy = JUMP_FORCE * 1.2;
          player.hasDoubleJump = false;
          createExplosion(player.x, player.y + 15, 10, '#ffcc00');
+         sfx.play('DOUBLE_JUMP');
      }
   };
 
   const initGame = () => {
+    sfx.init(); // Init Audio Context
+    sfx.play('POWERUP'); // Start sound
+
     const { width, height } = gameRef.current;
     
     // Reset Player
     gameRef.current.player = new Player(width / 2, height - 150);
     gameRef.current.player.vy = JUMP_FORCE; // Start with a jump
     
-    // Reset Platforms
+    // Reset Platforms & Obstacles
     gameRef.current.platforms = [];
-    // Initial platform under player
-    gameRef.current.platforms.push(new Platform(width / 2, height - 50, 'NORMAL'));
+    gameRef.current.obstacles = [];
+
+    // Initial START platform under player
+    gameRef.current.platforms.push(new Platform(width / 2, height - 50, 'START'));
     
     // Generate initial platforms
     let y = height - 50;
     while (y > -height) {
-      y -= 100 + Math.random() * 50;
+      y -= 70 + Math.random() * 40; // Closer together (EASIER)
       generatePlatform(y);
     }
 
@@ -539,21 +800,22 @@ const App = () => {
     let type: PlatformType = 'NORMAL';
     
     // Adjust probabilities based on score (difficulty)
-    const difficulty = Math.min(gameRef.current.score / 5000, 1); // 0 to 1
+    // Slower difficulty curve
+    const difficulty = Math.min(gameRef.current.score / 10000, 1); 
     
-    // Base probabilities
-    let pBoost = 0.05;
-    let pDouble = 0.05;
-    let pMoving = 0.1;
-    let pBreak = 0.05;
+    // Base probabilities - Easier config
+    let pBoost = 0.08; // More boost
+    let pDouble = 0.08; // More double jump
+    let pMoving = 0.05; // Less moving
+    let pBreak = 0.02; // Less breakable
     let pPhantom = 0.0;
     let pShrink = 0.0;
 
     // Difficulty scaling
     pMoving += difficulty * 0.15;
     pBreak += difficulty * 0.1;
-    pPhantom = difficulty > 0.1 ? 0.05 + difficulty * 0.1 : 0;
-    pShrink = difficulty > 0.2 ? 0.05 + difficulty * 0.1 : 0;
+    pPhantom = difficulty > 0.2 ? 0.02 + difficulty * 0.1 : 0; // Starts later
+    pShrink = difficulty > 0.3 ? 0.02 + difficulty * 0.1 : 0; // Starts later
     
     const r = Math.random();
     let cumulative = 0;
@@ -579,6 +841,33 @@ const App = () => {
     }
 
     gameRef.current.platforms.push(new Platform(x, y, type));
+
+    // --- Obstacle Generation Logic ---
+    // Start appearing after score 1500 (Easier)
+    if (gameRef.current.score > 1500) {
+        // Chance increases with score, cap at 20% chance per platform gen
+        const obstacleChance = Math.min((gameRef.current.score - 1500) / 10000, 0.2);
+        
+        if (Math.random() < obstacleChance) {
+             // Generate Obstacle
+             // Black holes only appear after 4000
+             const canBlackHole = gameRef.current.score > 4000;
+             const type: ObstacleType = (canBlackHole && Math.random() < 0.3) ? 'BLACK_HOLE' : 'UFO';
+             
+             // Ensure it's not directly on top of the platform we just made
+             // Put it somewhere else horizontally or slightly offset vertically
+             let ox = Math.random() * (width - 60) + 30;
+             // Distance check from platform
+             if (Math.abs(ox - x) < 80) { // Safer radius
+                 ox = (ox + width / 2) % width; // Move away
+             }
+             
+             // Place it slightly higher than the platform to be annoying
+             const oy = y - 70 - Math.random() * 50; 
+             
+             gameRef.current.obstacles.push(new Obstacle(ox, oy, type));
+        }
+    }
   };
 
   const createExplosion = (x: number, y: number, count: number, color: string) => {
@@ -618,7 +907,7 @@ const App = () => {
                 y: Math.random() * canvas.height,
                 size: Math.random() * 2 + 0.5,
                 alpha: Math.random(),
-                speed: Math.random() * 0.2 + 0.05,
+                speed: Math.random() * 0.1 + 0.02, // Slower stars
                 phase: Math.random() * Math.PI * 2
             });
         }
@@ -638,13 +927,55 @@ const App = () => {
     };
 
     const update = (time: number) => {
-      const { player, platforms, width, height, input } = gameRef.current;
+      const { player, platforms, obstacles, width, height, input } = gameRef.current;
 
       // Player Update
       player.update(input);
 
       // Platform Update (Moving & Special)
       platforms.forEach(p => p.update(width));
+      
+      // Obstacle Update & Collision
+      obstacles.forEach(o => {
+          o.update(width, player);
+          
+          // Distance for collision/gravity
+          const dx = player.x - o.x;
+          const dy = player.y - o.y;
+          const dist = Math.sqrt(dx*dx + dy*dy);
+
+          if (o.type === 'UFO') {
+              // Simple Hitbox
+              if (dist < o.radius + player.width) {
+                  // Knockback
+                  player.vy = 8; // Shoot down slower
+                  createExplosion(player.x, player.y, 10, '#00ff00');
+                  // Push sideways too
+                  player.vx = dx > 0 ? 3 : -3;
+                  sfx.play('EXPLOSION');
+              }
+          } else if (o.type === 'BLACK_HOLE') {
+              // Gravity Pull (Inverse Square Law approximation)
+              const pullRadius = 250;
+              if (dist < pullRadius) {
+                  const strength = 800; // weaker pull
+                  const force = strength / (dist * dist);
+                  // Apply force towards center
+                  player.vx -= (dx / dist) * force;
+                  player.vy -= (dy / dist) * force;
+                  
+                  // Add wobble/instability to player
+                  player.rotation += 0.1;
+              }
+
+              // Event Horizon (Death)
+              if (dist < 15) { // Center radius
+                  setGameState('GAME_OVER');
+                  createExplosion(player.x, player.y, 20, '#8000ff');
+                  sfx.play('GAME_OVER');
+              }
+          }
+      });
 
       // Screen Wrapping
       if (SCREEN_WRAP) {
@@ -662,6 +993,8 @@ const App = () => {
         
         // Move everything down
         platforms.forEach(p => p.y += diff);
+        obstacles.forEach(o => o.y += diff);
+        
         gameRef.current.stars.forEach(s => {
             s.y += diff * s.speed;
             if (s.y > height) {
@@ -677,7 +1010,7 @@ const App = () => {
         // Generate new platforms
         const highestPlatformY = Math.min(...platforms.map(p => p.y));
         if (highestPlatformY > 50) { // Keep some buffer
-             generatePlatform(highestPlatformY - (100 + Math.random() * 50));
+             generatePlatform(highestPlatformY - (70 + Math.random() * 40)); // ClOSER TOGETHER
         }
       }
 
@@ -687,33 +1020,59 @@ const App = () => {
               platforms.splice(i, 1);
           }
       }
+      for (let i = obstacles.length - 1; i >= 0; i--) {
+          if (obstacles[i].y > height) {
+              obstacles.splice(i, 1);
+          }
+      }
 
       // Collision Detection
       if (player.vy > 0) { // Only when falling
           platforms.forEach(p => {
-              if (p.isCollidable() && 
-                  player.x > p.x - p.radius - player.width/2 &&
-                  player.x < p.x + p.radius + player.width/2 &&
-                  player.y + player.height/2 >= p.y - p.radius && // Top of platform approx
-                  player.y + player.height/2 <= p.y + p.radius && // Inside platform
-                  player.y - player.vy + player.height/2 <= p.y - 10 // Was above previously (rough check)
-                 ) {
-                  
+              // Collision Box check
+              // For START platform, use a rectangular check more strictly or just wider radius
+              let hit = false;
+              if (p.isCollidable()) {
+                   if (p.type === 'START') {
+                       // Box collision
+                       if (player.x > p.x - p.radius && player.x < p.x + p.radius &&
+                           player.y + player.height/2 >= p.y - 10 &&
+                           player.y + player.height/2 <= p.y + 10 &&
+                           player.y - player.vy + player.height/2 <= p.y - 10) {
+                           hit = true;
+                       }
+                   } else {
+                       // Normal Circle Collision
+                       if (player.x > p.x - p.radius - player.width/2 &&
+                           player.x < p.x + p.radius + player.width/2 &&
+                           player.y + player.height/2 >= p.y - p.radius &&
+                           player.y + player.height/2 <= p.y + p.radius &&
+                           player.y - player.vy + player.height/2 <= p.y - 10) {
+                           hit = true;
+                       }
+                   }
+              }
+
+              if (hit) {
                   // Hit!
                   player.vy = JUMP_FORCE;
                   createExplosion(player.x, player.y + 15, 5, '#00f2ff');
+                  sfx.play('JUMP');
 
                   if (p.type === 'BOOST') {
                       player.vy = SUPER_JUMP_FORCE;
                       createExplosion(player.x, player.y + 15, 15, '#ff0055');
+                      sfx.play('BOOST');
                   }
                   if (p.type === 'DOUBLE_JUMP_CHARGER') {
                       player.hasDoubleJump = true;
                       p.type = 'NORMAL'; // Consume the charger
+                      sfx.play('POWERUP');
                   }
                   if (p.type === 'BREAKABLE') {
                       p.broken = true;
                       createExplosion(p.x, p.y, 10, '#ff4d4d');
+                      sfx.play('BREAK');
                   }
               }
           });
@@ -732,12 +1091,15 @@ const App = () => {
 
       // Game Over
       if (player.y > height) {
+          if (gameState === 'PLAYING') {
+              sfx.play('GAME_OVER');
+          }
           setGameState('GAME_OVER');
       }
     };
 
     const draw = (ctx: CanvasRenderingContext2D, time: number) => {
-      const { width, height, player, platforms, stars, particles } = gameRef.current;
+      const { width, height, player, platforms, obstacles, stars, particles } = gameRef.current;
 
       // Background Gradient
       const gradient = ctx.createLinearGradient(0, 0, 0, height);
@@ -760,6 +1122,9 @@ const App = () => {
 
       // Platforms
       platforms.forEach(p => p.draw(ctx, time));
+
+      // Obstacles
+      obstacles.forEach(o => o.draw(ctx, time));
 
       // Particles
       particles.forEach(p => {
@@ -816,7 +1181,7 @@ const App = () => {
           <p style={{ fontFamily: 'Rajdhani, sans-serif', fontSize: '24px', letterSpacing: '2px' }}>タップして発進</p>
           <div style={{ marginTop: '40px', fontSize: '16px', opacity: 0.8, fontFamily: 'Rajdhani, sans-serif' }}>
             <p>画面左右タップで移動</p>
-            <p>特殊な惑星を見極めろ</p>
+            <p>UFOとブラックホールに注意せよ</p>
           </div>
         </div>
       )}
